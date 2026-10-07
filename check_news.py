@@ -98,3 +98,122 @@ def search_google(keyword):
 def sort_key(pub_date):
     try:
         return parsedate_to_datetime(pub_date).timestamp()
+    except Exception:
+        return 0
+
+
+def title_key(title):
+    # 같은 기사가 네이버/구글 양쪽에 나오면 한 번만 알리기 위한 키
+    title = re.sub(r"\s+-\s+[^-]+$", "", clean_text(title))  # 구글 제목 끝 '- 언론사' 제거
+    return "t:" + re.sub(r"[^0-9A-Za-z가-힣]", "", title)
+
+
+def clean_text(text):
+    text = re.sub(r"<[^>]+>", "", text)  # <b> 같은 태그 제거
+    return html.unescape(text).strip()
+
+
+def slack_escape(text):
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def short_time(pub_date):
+    try:
+        return parsedate_to_datetime(pub_date).strftime("%m/%d %H:%M")
+    except Exception:
+        return ""
+
+
+def format_message(keyword, articles):
+    lines = [f":newspaper: *[{slack_escape(keyword)}]* 새 기사 {len(articles)}건"]
+    for a in articles[:10]:
+        title = slack_escape(clean_text(a["title"]))
+        when = short_time(a.get("pubDate", ""))
+        src = a.get("source", "")
+        lines.append(f"• `{src}` <{a['link']}|{title}>  _{when}_")
+    if len(articles) > 10:
+        lines.append(f"…외 {len(articles) - 10}건")
+    return "\n".join(lines)
+
+
+def send_slack(webhook_url, text):
+    data = json.dumps({"text": text, "unfurl_links": False}).encode("utf-8")
+    req = urllib.request.Request(
+        webhook_url, data=data, headers={"Content-Type": "application/json"}
+    )
+    urllib.request.urlopen(req, timeout=15)
+
+
+def main():
+    client_id = get_env("NAVER_CLIENT_ID", required=False)
+    client_secret = get_env("NAVER_CLIENT_SECRET", required=False)
+    use_naver = bool(client_id and client_secret)
+    if not use_naver:
+        print("[안내] 네이버 API 키가 없어 구글 뉴스만 확인합니다.")
+    webhook = get_env("SLACK_WEBHOOK_URL")
+
+    keywords = load_keywords()
+    state = load_state()
+    seen = set(state["links"])
+    known_keywords = set(state["keywords"])
+
+    started = []    # 이번에 새로 감시를 시작한 키워드
+    succeeded = set()
+
+    for keyword in keywords:
+        items = []
+        if use_naver:
+            try:
+                naver = search_news(keyword, client_id, client_secret)
+                if ONLY_NAVER_NEWS:
+                    naver = [i for i in naver if "n.news.naver.com" in i["link"]]
+                for i in naver:
+                    i["source"] = "네이버"
+                items += naver
+                succeeded.add(keyword)
+            except Exception as e:
+                print(f"[경고] 네이버 '{keyword}' 검색 실패: {e}")
+        try:
+            items += search_google(keyword)
+            succeeded.add(keyword)
+        except Exception as e:
+            print(f"[경고] 구글 '{keyword}' 검색 실패: {e}")
+        if keyword not in succeeded:
+            continue
+
+        fresh = []
+        for i in items:
+            tkey = title_key(i["title"])
+            if i["link"] in seen or tkey in seen:
+                continue
+            fresh.append(i)
+            for k in (i["link"], tkey):
+                state["links"].append(k)
+                seen.add(k)
+        fresh.sort(key=lambda i: sort_key(i.get("pubDate", "")), reverse=True)
+
+        if keyword not in known_keywords:
+            # 처음 등록된 키워드는 기존 기사를 알림 없이 기억만 함 (알림 폭탄 방지)
+            started.append(keyword)
+        elif fresh:
+            send_slack(webhook, format_message(keyword, fresh))
+            print(f"'{keyword}': 새 기사 {len(fresh)}건 알림")
+        else:
+            print(f"'{keyword}': 새 기사 없음")
+
+    state["keywords"] = [
+        k for k in keywords if k in known_keywords or k in succeeded
+    ]
+    save_state(state)
+
+    if started:
+        send_slack(
+            webhook,
+            ":white_check_mark: 감시 시작: "
+            + ", ".join(slack_escape(k) for k in started)
+            + "\n지금부터 새로 올라오는 기사를 알려드릴게요.",
+        )
+
+
+if __name__ == "__main__":
+    main()
